@@ -288,23 +288,29 @@ _PROBE: Final = {"_litellm_probe": 1}
 _AWS_TEST_KWARGS: Final = {"aws_access_key_id": "test", "aws_secret_access_key": "test", "aws_region_name": "us-west-2"}
 
 
-class _PreCallBodyRecorder(CustomLogger):
+class _BodyRecorder(CustomLogger):
     def __init__(self) -> None:
         super().__init__()
-        self.bodies: list[object] = []
+        self.bodies: tuple[Mapping[str, object], ...] = ()
+
+    def record(self, body: Mapping[str, object]) -> None:
+        self.bodies = (*self.bodies, body)
 
     def log_pre_api_call(self, model: str, messages: object, kwargs: Mapping[str, object]) -> None:
         additional_args: Final = kwargs["additional_args"]
         assert isinstance(additional_args, Mapping)
-        self.bodies.append(additional_args["complete_input_dict"])
+        body: Final = additional_args["complete_input_dict"]
+        assert isinstance(body, Mapping)
+        self.record(body)
 
+    def transport(self, response: httpx.Response) -> httpx.MockTransport:
+        def handle(request: httpx.Request) -> httpx.Response:
+            body: Final = json.loads(request.content)
+            assert isinstance(body, Mapping)
+            self.record(body)
+            return response
 
-def _recording_transport(wire: list[dict[str, object]], response: httpx.Response) -> httpx.MockTransport:
-    def handle(request: httpx.Request) -> httpx.Response:
-        wire.append(json.loads(request.content))
-        return response
-
-    return httpx.MockTransport(handle)
+        return httpx.MockTransport(handle)
 
 
 def _converse_event_frame(event_type: str, payload: Mapping[str, object]) -> bytes:
@@ -335,18 +341,18 @@ _CONVERSE_STREAM: Final = b"".join(
 )
 
 
-def _assert_pre_call_body_is_the_wire_body(recorder: _PreCallBodyRecorder, wire: list[dict[str, object]]) -> None:
-    assert len(wire) == 1 and len(recorder.bodies) == 1, (wire, recorder.bodies)
+def _assert_pre_call_body_is_the_wire_body(recorder: _BodyRecorder, wire: _BodyRecorder) -> None:
+    assert len(wire.bodies) == 1 and len(recorder.bodies) == 1, (wire.bodies, recorder.bodies)
     assert isinstance(recorder.bodies[0], Mapping), type(recorder.bodies[0])
-    assert json.loads(json.dumps(recorder.bodies[0])) == wire[0]
+    assert json.loads(json.dumps(recorder.bodies[0])) == wire.bodies[0]
 
 
 def test_converse_sync_pre_call_body_is_the_mapping_sent_on_the_wire(monkeypatch: pytest.MonkeyPatch) -> None:
-    wire: Final[list[dict[str, object]]] = []
-    recorder: Final = _PreCallBodyRecorder()
+    wire: Final = _BodyRecorder()
+    recorder: Final = _BodyRecorder()
     monkeypatch.setattr(litellm, "callbacks", [recorder])
     client: Final = HTTPHandler(
-        client=httpx.Client(transport=_recording_transport(wire, httpx.Response(200, json=CONVERSE_RESPONSE)))
+        client=httpx.Client(transport=wire.transport(httpx.Response(200, json=CONVERSE_RESPONSE)))
     )
     litellm.completion(model=_CONVERSE_MODEL, messages=_MESSAGES, client=client, extra_body=_PROBE, **_AWS_TEST_KWARGS)
     _assert_pre_call_body_is_the_wire_body(recorder, wire)
@@ -354,10 +360,12 @@ def test_converse_sync_pre_call_body_is_the_mapping_sent_on_the_wire(monkeypatch
 
 @pytest.mark.asyncio
 async def test_converse_async_pre_call_body_is_the_mapping_sent_on_the_wire(monkeypatch: pytest.MonkeyPatch) -> None:
-    wire: Final[list[dict[str, object]]] = []
-    recorder: Final = _PreCallBodyRecorder()
+    wire: Final = _BodyRecorder()
+    recorder: Final = _BodyRecorder()
     monkeypatch.setattr(litellm, "callbacks", [recorder])
-    client: Final = AsyncHTTPHandler(transport=_recording_transport(wire, httpx.Response(200, json=CONVERSE_RESPONSE)))
+    client: Final = AsyncHTTPHandler(
+        transport=wire.transport(httpx.Response(200, json=CONVERSE_RESPONSE))
+    )
     await litellm.acompletion(
         model=_CONVERSE_MODEL, messages=_MESSAGES, client=client, extra_body=_PROBE, **_AWS_TEST_KWARGS
     )
@@ -368,13 +376,13 @@ async def test_converse_async_pre_call_body_is_the_mapping_sent_on_the_wire(monk
 async def test_converse_async_stream_pre_call_body_is_the_mapping_sent_on_the_wire(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wire: Final[list[dict[str, object]]] = []
-    recorder: Final = _PreCallBodyRecorder()
+    wire: Final = _BodyRecorder()
+    recorder: Final = _BodyRecorder()
     monkeypatch.setattr(litellm, "callbacks", [recorder])
     stream_response: Final = httpx.Response(
         200, content=_CONVERSE_STREAM, headers={"content-type": "application/vnd.amazon.eventstream"}
     )
-    client: Final = AsyncHTTPHandler(transport=_recording_transport(wire, stream_response))
+    client: Final = AsyncHTTPHandler(transport=wire.transport(stream_response))
     stream: Final = await litellm.acompletion(
         model=_CONVERSE_MODEL, messages=_MESSAGES, stream=True, client=client, extra_body=_PROBE, **_AWS_TEST_KWARGS
     )
@@ -386,9 +394,9 @@ async def test_converse_async_stream_pre_call_body_is_the_mapping_sent_on_the_wi
 def test_converse_top_level_owned_kwarg_folds_into_additional_fields_and_warns_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    wire: Final[list[dict[str, object]]] = []
+    wire: Final = _BodyRecorder()
     client: Final = HTTPHandler(
-        client=httpx.Client(transport=_recording_transport(wire, httpx.Response(200, json=CONVERSE_RESPONSE)))
+        client=httpx.Client(transport=wire.transport(httpx.Response(200, json=CONVERSE_RESPONSE)))
     )
     with caplog.at_level(logging.WARNING, logger="LiteLLM"):
         litellm.completion(
@@ -401,6 +409,6 @@ def test_converse_top_level_owned_kwarg_folds_into_additional_fields_and_warns_o
     ]
     assert len(warnings) == 1, warnings
     assert warnings[0].split("keys=")[-1].split(".")[-1] == "_litellm_probe"
-    additional_fields: Final = wire[0]["additionalModelRequestFields"]
+    additional_fields: Final = wire.bodies[0]["additionalModelRequestFields"]
     assert isinstance(additional_fields, dict)
     assert additional_fields["_litellm_probe"] == 1

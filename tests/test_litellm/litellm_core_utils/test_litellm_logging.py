@@ -8431,6 +8431,43 @@ class TestBudgetReservationBinding:
         assert reservation["callback_bound"] is False
 
 
+class _BodyRecorder:
+    def __init__(self) -> None:
+        self.bodies: tuple[Mapping[str, object], ...] = ()
+
+    def record(self, body: Mapping[str, object]) -> None:
+        self.bodies = (*self.bodies, body)
+
+    def transport(self, payload: Mapping[str, object]) -> httpx.MockTransport:
+        def handle(request: httpx.Request) -> httpx.Response:
+            body: Final = json.loads(request.content)
+            assert isinstance(body, Mapping)
+            self.record(body)
+            return httpx.Response(200, json=dict(payload))
+
+        return httpx.MockTransport(handle)
+
+    def sse_transport(self) -> httpx.MockTransport:
+        def handle(request: httpx.Request) -> httpx.Response:
+            body: Final = json.loads(request.content)
+            assert isinstance(body, Mapping)
+            self.record(body)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    b'data: {"id":"chatcmpl-owned-keys","object":"chat.completion.chunk","created":1,'
+                    b'"model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},'
+                    b'"finish_reason":null}]}\n\n'
+                    b'data: {"id":"chatcmpl-owned-keys","object":"chat.completion.chunk","created":1,'
+                    b'"model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                    b"data: [DONE]\n\n"
+                ),
+            )
+
+        return httpx.MockTransport(handle)
+
+
 class TestOwnedKeysWarning:
     _PROBE: Final[dict[str, int]] = {"_litellm_probe": 1}
     _LEAKED_METADATA: Final[dict[str, dict[str, str]]] = {"metadata": {"user_api_key_hash": "h"}}
@@ -8485,27 +8522,19 @@ class TestOwnedKeysWarning:
         "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
     }
 
-    @staticmethod
-    def _recording_transport(bodies: list[dict[str, object]], payload: Mapping[str, object]) -> httpx.MockTransport:
-        def handle(request: httpx.Request) -> httpx.Response:
-            bodies.append(json.loads(request.content))
-            return httpx.Response(200, json=dict(payload))
-
-        return httpx.MockTransport(handle)
-
     @classmethod
-    def _openai_client(cls, bodies: list[dict[str, object]]) -> openai.OpenAI:
-        transport: Final = cls._recording_transport(bodies, cls._OPENAI_RESPONSE)
+    def _openai_client(cls, recorder: _BodyRecorder) -> openai.OpenAI:
+        transport: Final = recorder.transport(cls._OPENAI_RESPONSE)
         return openai.OpenAI(api_key="sk-test", http_client=httpx.Client(transport=transport))
 
     @classmethod
-    def _async_openai_client(cls, bodies: list[dict[str, object]]) -> openai.AsyncOpenAI:
-        transport: Final = cls._recording_transport(bodies, cls._OPENAI_RESPONSE)
+    def _async_openai_client(cls, recorder: _BodyRecorder) -> openai.AsyncOpenAI:
+        transport: Final = recorder.transport(cls._OPENAI_RESPONSE)
         return openai.AsyncOpenAI(api_key="sk-test", http_client=httpx.AsyncClient(transport=transport))
 
     @classmethod
-    def _azure_client(cls, bodies: list[dict[str, object]]) -> openai.AzureOpenAI:
-        transport: Final = cls._recording_transport(bodies, cls._OPENAI_RESPONSE)
+    def _azure_client(cls, recorder: _BodyRecorder) -> openai.AzureOpenAI:
+        transport: Final = recorder.transport(cls._OPENAI_RESPONSE)
         return openai.AzureOpenAI(
             api_key="sk-test",
             api_version=cls._AZURE_VERSION,
@@ -8514,8 +8543,8 @@ class TestOwnedKeysWarning:
         )
 
     @classmethod
-    def _async_azure_client(cls, bodies: list[dict[str, object]]) -> openai.AsyncAzureOpenAI:
-        transport: Final = cls._recording_transport(bodies, cls._OPENAI_RESPONSE)
+    def _async_azure_client(cls, recorder: _BodyRecorder) -> openai.AsyncAzureOpenAI:
+        transport: Final = recorder.transport(cls._OPENAI_RESPONSE)
         return openai.AsyncAzureOpenAI(
             api_key="sk-test",
             api_version=cls._AZURE_VERSION,
@@ -8523,40 +8552,21 @@ class TestOwnedKeysWarning:
             http_client=httpx.AsyncClient(transport=transport),
         )
 
-    @staticmethod
-    def _sse_transport(bodies: list[dict[str, object]]) -> httpx.MockTransport:
-        def handle(request: httpx.Request) -> httpx.Response:
-            bodies.append(json.loads(request.content))
-            return httpx.Response(
-                200,
-                headers={"content-type": "text/event-stream"},
-                content=(
-                    b'data: {"id":"chatcmpl-owned-keys","object":"chat.completion.chunk","created":1,'
-                    b'"model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},'
-                    b'"finish_reason":null}]}\n\n'
-                    b'data: {"id":"chatcmpl-owned-keys","object":"chat.completion.chunk","created":1,'
-                    b'"model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
-                    b"data: [DONE]\n\n"
-                ),
-            )
-
-        return httpx.MockTransport(handle)
+    @classmethod
+    def _anthropic_handler(cls, recorder: _BodyRecorder) -> HTTPHandler:
+        return HTTPHandler(client=httpx.Client(transport=recorder.transport(cls._ANTHROPIC_RESPONSE)))
 
     @classmethod
-    def _anthropic_handler(cls, bodies: list[dict[str, object]]) -> HTTPHandler:
-        return HTTPHandler(client=httpx.Client(transport=cls._recording_transport(bodies, cls._ANTHROPIC_RESPONSE)))
+    def _async_anthropic_handler(cls, recorder: _BodyRecorder) -> AsyncHTTPHandler:
+        return AsyncHTTPHandler(transport=recorder.transport(cls._ANTHROPIC_RESPONSE))
 
     @classmethod
-    def _async_anthropic_handler(cls, bodies: list[dict[str, object]]) -> AsyncHTTPHandler:
-        return AsyncHTTPHandler(transport=cls._recording_transport(bodies, cls._ANTHROPIC_RESPONSE))
+    def _gemini_handler(cls, recorder: _BodyRecorder) -> HTTPHandler:
+        return HTTPHandler(client=httpx.Client(transport=recorder.transport(cls._GEMINI_RESPONSE)))
 
     @classmethod
-    def _gemini_handler(cls, bodies: list[dict[str, object]]) -> HTTPHandler:
-        return HTTPHandler(client=httpx.Client(transport=cls._recording_transport(bodies, cls._GEMINI_RESPONSE)))
-
-    @classmethod
-    def _bedrock_handler(cls, bodies: list[dict[str, object]], payload: Mapping[str, object]) -> HTTPHandler:
-        return HTTPHandler(client=httpx.Client(transport=cls._recording_transport(bodies, payload)))
+    def _bedrock_handler(cls, recorder: _BodyRecorder, payload: Mapping[str, object]) -> HTTPHandler:
+        return HTTPHandler(client=httpx.Client(transport=recorder.transport(payload)))
 
     _WARNING: Final = re.compile(
         r"^LiteLLM-owned keys reached the provider request body\. "
@@ -8586,31 +8596,31 @@ class TestOwnedKeysWarning:
         assert self._owned_warnings(caplog) == []
 
     def test_openai_sync_warns_on_owned_key_in_extra_body(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._openai_client(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._openai_client(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = litellm.completion(
                 model="gpt-5.4", messages=self._MESSAGES, api_key="sk-test", client=client, extra_body=self._PROBE
             )
         self._assert_warned_once(caplog, "openai", "gpt-5.4")
         assert response.choices[0].message.content == "Hi"
-        assert bodies[0]["_litellm_probe"] == 1
+        assert recorder.bodies[0]["_litellm_probe"] == 1
 
     @pytest.mark.asyncio
     async def test_openai_async_warns_on_owned_key_in_extra_body(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._async_openai_client(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._async_openai_client(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = await litellm.acompletion(
                 model="gpt-5.4", messages=self._MESSAGES, api_key="sk-test", client=client, extra_body=self._PROBE
             )
         self._assert_warned_once(caplog, "openai", "gpt-5.4")
         assert response.choices[0].message.content == "Hi"
-        assert bodies[0]["_litellm_probe"] == 1
+        assert recorder.bodies[0]["_litellm_probe"] == 1
 
     def test_openai_sync_stream_warns_once_on_owned_key(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = openai.OpenAI(api_key="sk-test", http_client=httpx.Client(transport=self._sse_transport(bodies)))
+        recorder: Final = _BodyRecorder()
+        client: Final = openai.OpenAI(api_key="sk-test", http_client=httpx.Client(transport=recorder.sse_transport()))
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = litellm.completion(
                 model="gpt-5.4",
@@ -8623,12 +8633,12 @@ class TestOwnedKeysWarning:
             chunks: Final = list(response)
         assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == "Hi"
         self._assert_warned_once(caplog, "openai", "gpt-5.4")
-        assert bodies[0]["_litellm_probe"] == 1
-        assert bodies[0]["stream"] is True
+        assert recorder.bodies[0]["_litellm_probe"] == 1
+        assert recorder.bodies[0]["stream"] is True
 
     def test_openai_sync_no_owned_key_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._openai_client(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._openai_client(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(model="gpt-5.4", messages=self._MESSAGES, api_key="sk-test", client=client)
         self._assert_no_warning(caplog)
@@ -8648,20 +8658,20 @@ class TestOwnedKeysWarning:
         assert logging_obj.model_call_details["litellm_params"]["api_base"] == "https://x.test/v1"
 
     def test_openai_sync_tool_schema_names_do_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._openai_client(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._openai_client(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="gpt-4o", messages=self._MESSAGES, api_key="sk-test", client=client, tools=self._TOOLS
             )
         self._assert_no_warning(caplog)
-        tools: Final = bodies[0]["tools"]
+        tools: Final = recorder.bodies[0]["tools"]
         assert isinstance(tools, list)
         assert "model_info" in tools[0]["function"]["parameters"]["properties"]
 
     def test_openai_sync_warns_on_leaked_metadata_in_extra_body(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._openai_client(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._openai_client(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="gpt-5.4",
@@ -8671,16 +8681,16 @@ class TestOwnedKeysWarning:
                 extra_body=self._LEAKED_METADATA,
             )
         self._assert_warned_once(caplog, "openai", "gpt-5.4", keys="metadata.user_api_key_hash")
-        assert bodies[0]["metadata"] == {"user_api_key_hash": "h"}
-        assert "extra_body" not in bodies[0]
+        assert recorder.bodies[0]["metadata"] == {"user_api_key_hash": "h"}
+        assert "extra_body" not in recorder.bodies[0]
 
     @pytest.mark.asyncio
     async def test_openai_async_stream_warns_on_leaked_metadata_in_extra_body(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        bodies: Final[list[dict[str, object]]] = []
+        recorder: Final = _BodyRecorder()
         client: Final = openai.AsyncOpenAI(
-            api_key="sk-test", http_client=httpx.AsyncClient(transport=self._sse_transport(bodies))
+            api_key="sk-test", http_client=httpx.AsyncClient(transport=recorder.sse_transport())
         )
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = await litellm.acompletion(
@@ -8694,12 +8704,12 @@ class TestOwnedKeysWarning:
             chunks: Final = [chunk async for chunk in response]
         assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == "Hi"
         self._assert_warned_once(caplog, "openai", "gpt-5.4", keys="metadata.user_api_key_hash")
-        assert bodies[0]["metadata"] == {"user_api_key_hash": "h"}
-        assert bodies[0]["stream"] is True
+        assert recorder.bodies[0]["metadata"] == {"user_api_key_hash": "h"}
+        assert recorder.bodies[0]["stream"] is True
 
     def test_openai_sync_warns_once_listing_every_leaked_key(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._openai_client(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._openai_client(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="gpt-5.4",
@@ -8709,12 +8719,12 @@ class TestOwnedKeysWarning:
                 extra_body={**self._PROBE, **self._LEAKED_METADATA},
             )
         self._assert_warned_once(caplog, "openai", "gpt-5.4", keys="_litellm_probe, metadata.user_api_key_hash")
-        assert bodies[0]["_litellm_probe"] == 1
-        assert bodies[0]["metadata"] == {"user_api_key_hash": "h"}
+        assert recorder.bodies[0]["_litellm_probe"] == 1
+        assert recorder.bodies[0]["metadata"] == {"user_api_key_hash": "h"}
 
     def test_azure_sync_warns_on_leaked_metadata_in_extra_body(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._azure_client(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._azure_client(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = litellm.completion(
                 model="azure/gpt-5.4",
@@ -8727,13 +8737,13 @@ class TestOwnedKeysWarning:
             )
         self._assert_warned_once(caplog, "azure", "azure/gpt-5.4", keys="metadata.user_api_key_hash")
         assert response.choices[0].message.content == "Hi"
-        assert bodies[0]["metadata"] == {"user_api_key_hash": "h"}
-        assert "extra_body" not in bodies[0]
+        assert recorder.bodies[0]["metadata"] == {"user_api_key_hash": "h"}
+        assert "extra_body" not in recorder.bodies[0]
 
     @pytest.mark.asyncio
     async def test_azure_async_warns_on_leaked_metadata_in_extra_body(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._async_azure_client(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._async_azure_client(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = await litellm.acompletion(
                 model="azure/gpt-5.4",
@@ -8746,12 +8756,12 @@ class TestOwnedKeysWarning:
             )
         self._assert_warned_once(caplog, "azure", "azure/gpt-5.4", keys="metadata.user_api_key_hash")
         assert response.choices[0].message.content == "Hi"
-        assert bodies[0]["metadata"] == {"user_api_key_hash": "h"}
-        assert "extra_body" not in bodies[0]
+        assert recorder.bodies[0]["metadata"] == {"user_api_key_hash": "h"}
+        assert "extra_body" not in recorder.bodies[0]
 
     def test_anthropic_sync_warns_on_owned_key(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._anthropic_handler(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._anthropic_handler(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = litellm.completion(
                 model="anthropic/claude-opus-4-8",
@@ -8761,13 +8771,13 @@ class TestOwnedKeysWarning:
                 extra_body=self._PROBE,
             )
         self._assert_warned_once(caplog, "anthropic", "anthropic/claude-opus-4-8")
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
         assert response.choices[0].message.content == "Hi"
 
     @pytest.mark.asyncio
     async def test_anthropic_async_warns_on_owned_key(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._async_anthropic_handler(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._async_anthropic_handler(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = await litellm.acompletion(
                 model="anthropic/claude-opus-4-8",
@@ -8777,22 +8787,22 @@ class TestOwnedKeysWarning:
                 extra_body=self._PROBE,
             )
         self._assert_warned_once(caplog, "anthropic", "anthropic/claude-opus-4-8")
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
         assert response.choices[0].message.content == "Hi"
 
     def test_anthropic_sync_no_owned_key_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._anthropic_handler(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._anthropic_handler(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="anthropic/claude-opus-4-8", messages=self._MESSAGES, api_key="test", client=client
             )
         self._assert_no_warning(caplog)
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
 
     def test_anthropic_sync_tool_schema_names_do_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._anthropic_handler(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._anthropic_handler(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="anthropic/claude-opus-4-8",
@@ -8802,11 +8812,11 @@ class TestOwnedKeysWarning:
                 tools=self._TOOLS,
             )
         self._assert_no_warning(caplog)
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
 
     def test_gemini_sync_warns_on_owned_key(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._gemini_handler(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._gemini_handler(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = litellm.completion(
                 model="gemini/gemini-2.5-flash",
@@ -8816,20 +8826,20 @@ class TestOwnedKeysWarning:
                 extra_body=self._PROBE,
             )
         self._assert_warned_once(caplog, "gemini", "gemini/gemini-2.5-flash")
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
         assert response.choices[0].message.content == "Hi"
 
     def test_gemini_sync_no_owned_key_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._gemini_handler(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._gemini_handler(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(model="gemini/gemini-2.5-flash", messages=self._MESSAGES, api_key="test", client=client)
         self._assert_no_warning(caplog)
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
 
     def test_gemini_sync_tool_schema_names_do_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._gemini_handler(bodies)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._gemini_handler(recorder)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="gemini/gemini-2.5-flash",
@@ -8839,11 +8849,11 @@ class TestOwnedKeysWarning:
                 tools=self._TOOLS,
             )
         self._assert_no_warning(caplog)
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
 
     def test_bedrock_invoke_warns_on_owned_key(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._bedrock_handler(bodies, self._BEDROCK_INVOKE_RESPONSE)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._bedrock_handler(recorder, self._BEDROCK_INVOKE_RESPONSE)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             response: Final = litellm.completion(
                 model="bedrock/invoke/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -8855,13 +8865,13 @@ class TestOwnedKeysWarning:
                 extra_body=self._PROBE,
             )
         self._assert_warned_once(caplog, "bedrock", "bedrock/invoke/us.anthropic.claude-sonnet-4-5-20250929-v1:0")
-        assert len(bodies) == 1
-        assert bodies[0]["_litellm_probe"] == 1
+        assert len(recorder.bodies) == 1
+        assert recorder.bodies[0]["_litellm_probe"] == 1
         assert response.choices[0].message.content == "Hi"
 
     def test_bedrock_invoke_no_owned_key_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._bedrock_handler(bodies, self._BEDROCK_INVOKE_RESPONSE)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._bedrock_handler(recorder, self._BEDROCK_INVOKE_RESPONSE)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="bedrock/invoke/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -8872,11 +8882,11 @@ class TestOwnedKeysWarning:
                 client=client,
             )
         self._assert_no_warning(caplog)
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
 
     def test_bedrock_invoke_tool_schema_names_do_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._bedrock_handler(bodies, self._BEDROCK_INVOKE_RESPONSE)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._bedrock_handler(recorder, self._BEDROCK_INVOKE_RESPONSE)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="bedrock/invoke/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -8888,13 +8898,13 @@ class TestOwnedKeysWarning:
                 tools=self._TOOLS,
             )
         self._assert_no_warning(caplog)
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
 
     def test_bedrock_converse_extra_body_lands_in_additional_model_request_fields_and_does_not_warn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._bedrock_handler(bodies, self._BEDROCK_CONVERSE_RESPONSE)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._bedrock_handler(recorder, self._BEDROCK_CONVERSE_RESPONSE)
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
                 model="bedrock/converse/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -8906,16 +8916,16 @@ class TestOwnedKeysWarning:
                 extra_body=self._PROBE,
             )
         self._assert_no_warning(caplog)
-        assert len(bodies) == 1
-        additional_fields: Final = bodies[0]["additionalModelRequestFields"]
+        assert len(recorder.bodies) == 1
+        additional_fields: Final = recorder.bodies[0]["additionalModelRequestFields"]
         assert isinstance(additional_fields, dict)
         extra_body: Final = additional_fields["extra_body"]
         assert isinstance(extra_body, dict)
         assert extra_body["_litellm_probe"] == 1
 
     def test_bedrock_converse_warns_on_owned_top_level_kwarg(self, caplog: pytest.LogCaptureFixture) -> None:
-        bodies: Final[list[dict[str, object]]] = []
-        client: Final = self._bedrock_handler(bodies, self._BEDROCK_CONVERSE_RESPONSE)
+        recorder: Final = _BodyRecorder()
+        client: Final = self._bedrock_handler(recorder, self._BEDROCK_CONVERSE_RESPONSE)
         model: Final = "bedrock/converse/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
         with caplog.at_level(logging.WARNING, logger="LiteLLM"):
             litellm.completion(
@@ -8928,4 +8938,4 @@ class TestOwnedKeysWarning:
                 _litellm_probe=1,
             )
         self._assert_warned_once(caplog, "bedrock", model, keys="additionalModelRequestFields._litellm_probe")
-        assert len(bodies) == 1
+        assert len(recorder.bodies) == 1
